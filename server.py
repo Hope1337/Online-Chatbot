@@ -1,83 +1,60 @@
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, TextStreamer
-from flask import Flask, request, jsonify, Response, stream_with_context
 import json
-from queue import Queue
+import os
+from flask import Flask, request, jsonify, Response, stream_with_context
+from functools import wraps
+from utils.utils import get_model, generate_stream, create_prompt
+from utils.retriever import Retrieval
+
+with open("data/api_aut.json", "r") as f:
+    data_key = json.load(f)
+
+VALID_API_KEYS = data_key[0]['API_KEY']
+
+raw_doc_folder     = "data/pdf"
+encoded_doc_folder = "data/embedded"
+
+# Load model và tokenizer
+tokenizer, model = get_model()
+retriever = Retrieval(
+    raw_doc_folder=raw_doc_folder,
+    encoded_doc_folder=encoded_doc_folder
+)
 
 app = Flask(__name__)
 
-# Cấu hình quantization
-bnb_config = BitsAndBytesConfig(
-    load_in_8bit=True,
-    llm_int8_threshold=6.0,
-)
+def require_api_key(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        api_key = request.headers.get("X-API-Key")
+        if not api_key or api_key not in VALID_API_KEYS:
+            return jsonify({"error": "Invalid or missing API key"}), 401
+        return f(*args, **kwargs)
+    return decorated
 
-# Load model và tokenizer
-model_name = "Qwen/Qwen2.5-7B-Instruct"
-tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    quantization_config=bnb_config,
-    device_map="auto",
-    trust_remote_code=True,
-)
+@app.route("/update_doc_list", methods=["GET"])
+@require_api_key
+def update_doc_list():
+    folder_path = raw_doc_folder
+    
+    if not os.path.isdir(folder_path):
+        return jsonify({"error": "Invalid folder path"}), 400
 
-def generate_stream(prompt):
-    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
-    
-    # Tạo queue để lưu trữ các token
-    token_queue = Queue()
-    
-    # Custom streamer để gửi từng token
-    class CustomStreamer(TextStreamer):
-        def __init__(self, tokenizer, queue, **kwargs):
-            super().__init__(tokenizer, **kwargs)
-            self.queue = queue
-        
-        def on_finalized_text(self, text: str, stream_end: bool = False):
-            # Gửi text không rỗng vào queue
-            if text.strip():
-                self.queue.put(text)
-            if stream_end:
-                self.queue.put("")  # Kết thúc stream
+    bin_files = [os.path.splitext(f)[0] for f in os.listdir(folder_path)
+                 if f.endswith('.pdf') and os.path.isfile(os.path.join(folder_path, f))]
 
-    streamer = CustomStreamer(tokenizer, token_queue, skip_prompt=True, skip_special_tokens=True)
-    
-    # Chạy model.generate trong một thread riêng để tránh block
-    from threading import Thread
-    
-    def run_generate():
-        try:
-            model.generate(
-                **inputs,
-                max_length=32768,
-                num_return_sequences=1,
-                temperature=0.7,
-                top_p=0.9,
-                do_sample=True,
-                streamer=streamer,
-            )
-        except Exception as e:
-            token_queue.put(f"Error: {str(e)}")
-    
-    # Bắt đầu thread để chạy model.generate
-    generate_thread = Thread(target=run_generate)
-    generate_thread.start()
-    
-    # Yield các token từ queue
-    while True:
-        token = token_queue.get()
-        yield token
-        if token == "":  # Kết thúc stream
-            break
-    
-    generate_thread.join()
+    return jsonify({"files": bin_files})
 
-@app.route("/predict", methods=["POST"])
-def predict():
+
+@app.route("/generate", methods=["POST"])
+@require_api_key
+def generate():
     try:
         data = request.get_json()
-        prompt = data.get("prompt", "")
+        prompt = create_prompt(data, tokenizer, retriever)
+        print(prompt)
+        print("#########################################")
+        print()
         
         if not prompt:
             return jsonify({"error": "Prompt is required"}), 400
@@ -93,7 +70,7 @@ def predict():
 
         def generate():
             try:
-                for token in generate_stream(text):
+                for token in generate_stream(text, tokenizer, model):
                     yield token
             except Exception as e:
                 yield f"Error: {str(e)}"
